@@ -51,6 +51,17 @@ class BIP32:
         self.public_key = b"\x03" if point.y() % 2 else b"\x02"
         self.public_key += point.x().to_bytes(32, "big")
 
+        # Create xpub
+        xpub_bytes = (
+            b"\x04\x88\xb2\x1e"  # Version bytes for xpub
+            + bytes([self.depth])
+            + self.parent_fingerprint
+            + self.child_number.to_bytes(4, "big")
+            + self.chain_code
+            + self.public_key
+        )
+        self.xpub = base58.b58encode_check(xpub_bytes).decode()
+
     def _parse_path(self, path: str) -> List[int]:
         """Convert BIP32 path string to index array"""
         if path.startswith("m/"):
@@ -249,6 +260,7 @@ if __name__ == "__main__":
     print(f"Derivation path: {path}")
 
     bip32 = BIP32(xprv)
+    print(f"Root public key (xpub): {bip32.xpub}")
     child_pubkey = bip32.derive_child_pubkey(path)
     print(f"Child public key: {child_pubkey}")
     child_privkey = bip32.derive_child_privkey(path)

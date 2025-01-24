@@ -35,12 +35,12 @@ function derivePath(entropyAddress: string) {
 
 // Main logic
 (async () => {
-    // Load xprv from environment variables
-    const xprv = process.env.ROOT_XPRV;
+    // Load xpub from environment variables
+    const xpub = process.env.ROOT_XPUB;
 
-    // Check if xprv is provided
-    if (!xprv) {
-        console.error('Error: ROOT_XPRV not found in environment variables.');
+    // Check if xpub is provided
+    if (!xpub) {
+        console.error('Error: ROOT_XPUB not found in environment variables.');
         return;
     }
 
@@ -52,19 +52,15 @@ function derivePath(entropyAddress: string) {
     const path = derivePath(entropyAddress);
     console.log(`Derivation path: ${path}`);
 
-    // Load BIP32 root key from xprv
+    // Load BIP32 root key from xpub
     const bip32 = BIP32Factory(ecc);
-    const rootNode = bip32.fromBase58(xprv);
+    const rootNode = bip32.fromBase58(xpub);
 
     // Derive the child node using the path
     const childNode = rootNode.derivePath(path);
 
-    // Get the child private key and public key
-    const childPrivateKey = childNode.privateKey;
+    // Get the child public key
     const childPublicKey = childNode.publicKey;
-
-    // Display the child private key in hex format
-    console.log(`Child private key: ${childPrivateKey.toString('hex')}`);
 
     // Display the child public key in hex format
     console.log(`Child public key: ${childPublicKey.toString('hex')}`);
