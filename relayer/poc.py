@@ -12,29 +12,8 @@ from base58 import b58encode_check
 from tronpy import Tron
 from tronpy.providers import HTTPProvider
 from tronpy.keys import PrivateKey
-from sqlite3 import connect, OperationalError
-from threading import Thread, Event
-from queue import Queue, Empty
-import schedule
-from datetime import datetime
 
 load_dotenv()
-
-# Database setup
-DB_PATH = os.getenv("DB_PATH", "addresses.db")
-
-def init_db():
-    with connect(DB_PATH) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS entropy_addresses (
-                address TEXT PRIMARY KEY,
-                processing BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_checked TIMESTAMP
-            )
-        """)
-
-init_db()
 
 client = Tron(
     provider=HTTPProvider(
@@ -252,183 +231,78 @@ def supply_address(address: str):
     print(f"[Tron] Supply tx result: {receipt}")
 
 
-class AddressMonitor:
-    def __init__(self, xprv: str):
-        self.xprv = xprv
-        self.stop_event = Event()
-        self.queue = Queue()
-        
-        # Start worker threads
-        Thread(target=self._process_queue, daemon=True).start()
-        Thread(target=self._schedule_checks, daemon=True).start()
-
-    def add_address(self, entropy_address: str):
-        with connect(DB_PATH) as conn:
-            conn.execute("""
-                INSERT OR IGNORE INTO entropy_addresses (address) 
-                VALUES (?)
-            """, (entropy_address,))
-
-    def _get_pending_addresses(self):
-        with connect(DB_PATH) as conn:
-            cursor = conn.execute("""
-                UPDATE entropy_addresses 
-                SET processing = TRUE 
-                WHERE address IN (
-                    SELECT address 
-                    FROM entropy_addresses 
-                    WHERE processing = FALSE 
-                    ORDER BY created_at 
-                    LIMIT 100
-                )
-                RETURNING address
-            """)
-            return [row[0] for row in cursor.fetchall()]
-
-    def _schedule_checks(self):
-        schedule.every(5).seconds.do(self._enqueue_addresses)
-        while not self.stop_event.is_set():
-            schedule.run_pending()
-            time.sleep(1)
-
-    def _enqueue_addresses(self):
-        addresses = self._get_pending_addresses()
-        if addresses:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Found {len(addresses)} addresses to monitor")
-        for address in addresses:
-            self.queue.put(address)
-
-    def _process_queue(self):
-        while not self.stop_event.is_set():
-            try:
-                entropy_address = self.queue.get(timeout=1)
-                try:
-                    self._monitor_address(entropy_address)
-                finally:
-                    self.queue.task_done()
-            except Empty:
-                continue  # No items in queue, continue waiting
-            except Exception as e:
-                print(f"Error processing address: {e}")
-
-    def _monitor_address(self, entropy_address: str):
-        path = derive_path(entropy_address)
-        bip32 = BIP32(self.xprv)
-        
-        try:
-            child_tron_address = bip32.derive_tron_address(path)
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Started monitoring {entropy_address[:10]}...{entropy_address[-8:]} -> {child_tron_address}")
-            usdt = client.get_contract("TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t")
-            
-            while not self.stop_event.is_set():
-                try:
-                    balance = usdt.functions.balanceOf(child_tron_address)
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] Balance check: {balance} USDT @ {child_tron_address[:10]}...{child_tron_address[-8:]}")
-                    if balance > 0:
-                        print(f"[{datetime.now().strftime('%H:%M:%S')}] Found positive balance, processing...")
-                        self._handle_balance(child_tron_address, bip32, path)
-                        break  # Balance handled, stop monitoring
-                        
-                    # Update last checked time
-                    with connect(DB_PATH) as conn:
-                        conn.execute("""
-                            UPDATE entropy_addresses 
-                            SET last_checked = CURRENT_TIMESTAMP,
-                                processing = FALSE 
-                            WHERE address = ?
-                        """, (entropy_address,))
-                    
-                    time.sleep(5)  # Check balance every 5 seconds
-                    
-                except Exception as e:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] Error checking {child_tron_address[:10]}...{child_tron_address[-8:]}: {e}")
-                    time.sleep(5)
-        
-        finally:
-            with connect(DB_PATH) as conn:
-                conn.execute("""
-                    UPDATE entropy_addresses 
-                    SET processing = FALSE 
-                    WHERE address = ?
-                """, (entropy_address,))
-
-    def _handle_balance(self, child_tron_address: str, bip32: BIP32, path: str):
-        child_privkey = bip32.derive_child_privkey(path)
-        child_signer = PrivateKey(bytes.fromhex(child_privkey))
-        
-        usdt = client.get_contract("TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t")
-        balance = usdt.functions.balanceOf(child_tron_address)
-        if balance == 0:
-            print("Balance is 0, skipping")
-            return
-        
-        try:
-            trx_balance = client.get_account_balance(child_tron_address)
-        except Exception:
-            trx_balance = 0
-        
-        print(f"TRX balance: {trx_balance}")
-        
-        if trx_balance < 1:  # 1 TRX is enough for the approval given the rental
-            supply_address(child_tron_address)
-        
-        allowance = usdt.functions.allowance(child_tron_address, sunswap_v2.address)
-        if allowance == 0:
-            print("Allowance is 0, setting max approval")
-
-            lend_energy(child_tron_address, 101000)  # enough for the approval and swap
-
-            txn = (
-                usdt.functions.approve(sunswap_v2.address, 2**256 - 1)
-                    .with_owner(child_tron_address)
-                    .fee_limit(100_000_000)
-                    .build()
-                    .sign(child_signer)
-            )
-            receipt = txn.broadcast().wait()
-            print(f"[Tron] Approve tx result: {receipt}")
-        else:
-            print("Allowance is already set")
-
-        txn = (
-            sunswap_v2.functions.swapExactTokensForTokens(
-                balance,
-                1,  # we know that there'd be no slippage
-                [
-                    "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
-                    "TPXxtMtQg95VX8JRCiQ5SXqSeHjuNaMsxi"
-                ],
-                relayer_address,  # swap new USDT into wrapped tokens and send them to the relayer
-                9999999999,  # large deadline
-            )
-            .with_owner(child_tron_address)
-            .fee_limit(2_000_000)
-            .build()
-            .sign(child_signer)
-        )
-        receipt = txn.broadcast().wait()
-        print(f"[Tron] Swap tx result: {receipt}")
-
-    def stop(self):
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Shutting down monitor...")
-        self.stop_event.set()
-        try:
-            self.queue.join(timeout=5)  # Wait up to 5 seconds for tasks to complete
-        except TimeoutError:
-            print("Some tasks did not complete in time")
-
 # Main logic
 if __name__ == "__main__":
     # Import xprv from .env
     xprv = os.getenv("ROOT_XPRV")
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting address monitor...")
-    monitor = AddressMonitor(xprv)
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Monitor initialized, adding test address...")
-    monitor.add_address("0x1234567890123456789012345678901234567890")
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Test address added, monitoring started")
+
+    # Example entropy address in the EVM format
+    entropy_address = "0x1234567890123456789012345678901234567890"
+    print(f"Entropy address: {entropy_address}")
+
+    # Get derivation path from the EVM entropy address
+    path = derive_path(entropy_address)
+    print(f"Derivation path: {path}")
+
+    bip32 = BIP32(xprv)
+    child_pubkey = bip32.derive_child_pubkey(path)
+    print(f"Child public key: {child_pubkey}")
+    child_privkey = bip32.derive_child_privkey(path)
+    print(f"Child private key: {child_privkey}")
+    child_tron_address = bip32.derive_tron_address(path)
+    print(f"Child Tron address: {child_tron_address}")
+
+    child_signer = PrivateKey(bytes.fromhex(child_privkey))
+
+    usdt = client.get_contract("TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t")
+    balance = usdt.functions.balanceOf(child_tron_address)
+    if balance == 0:
+        print("Balance is 0, exiting")
+        exit()
     
     try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        monitor.stop()
+        trx_balance = client.get_account_balance(child_tron_address)
+    except Exception:
+        trx_balance = 0
+    
+    print(f"TRX balance: {trx_balance}")
+    
+    if trx_balance < 1: # 1 TRX is enough for the approval given the rental
+        supply_address(child_tron_address)
+    
+    allowance = usdt.functions.allowance(child_tron_address, sunswap_v2.address)
+    if allowance == 0:
+        print("Allowance is 0, setting max approval")
+
+        lend_energy(child_tron_address, 101000) # enough for the approval and swap
+
+        txn = (
+            usdt.functions.approve(sunswap_v2.address, 2**256 - 1)
+                .with_owner(child_tron_address)
+                .fee_limit(100_000_000)
+                .build()
+                .sign(child_signer)
+        )
+        receipt = txn.broadcast().wait()
+        print(f"[Tron] Approve tx result: {receipt}")
+    else:
+        print("Allowance is already set")
+
+    txn = (
+        sunswap_v2.functions.swapExactTokensForTokens(
+            balance,
+            1,  # we know that there'd be no slippage
+            [
+                "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
+                "TPXxtMtQg95VX8JRCiQ5SXqSeHjuNaMsxi"
+            ],
+            relayer_address, # swap new USDT into wrapped tokens and send them to the relayer
+            9999999999,  # large deadline
+        )
+        .with_owner(child_tron_address)
+        .fee_limit(2_000_000)
+        .build()
+        .sign(child_signer)
+    )
+    receipt = txn.broadcast().wait()
+    print(f"[Tron] Swap tx result: {receipt}")
