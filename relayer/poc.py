@@ -164,9 +164,13 @@ class BIP32:
             32, "big"
         )
 
+        print("pubkey_bytes", pubkey_bytes.hex())
+
         # Take keccak256 hash and get last 20 bytes for address
         keccak = Web3.keccak(pubkey_bytes)
         address = keccak[-20:]
+
+        print("address", address.hex())
 
         # Return address in Tron format
         return b58encode_check(b"\x41" + address).decode()
@@ -251,6 +255,8 @@ if __name__ == "__main__":
     print(f"Child private key: {child_privkey}")
     child_tron_address = bip32.derive_tron_address(path)
     print(f"Child Tron address: {child_tron_address}")
+
+    exit()
 
     child_signer = PrivateKey(bytes.fromhex(child_privkey))
 

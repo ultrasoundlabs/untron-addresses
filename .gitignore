@@ -182,3 +182,5 @@ anvil-zksync.log
 .DS_Store
 
 addresses.db
+
+node_modules
