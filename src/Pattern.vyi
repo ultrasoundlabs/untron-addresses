@@ -1,0 +1,12 @@
+# pragma version 0.4.0
+# @license BUSL
+
+# @title Pattern
+# @author Ultrasound Labs
+# @notice A pattern contract is a contract that builds withdrawal transactions
+#         of USDT TRC-20 based on the amount of USDT,
+#         the recipient address, and additional data.
+#         All pattern contracts must implement this interface.
+
+interface Pattern:
+    def buildTransaction(amount: uint256, recipient: bytes20, data: Bytes[1024]) -> bytes32: nonpayable
