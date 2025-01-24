@@ -12,13 +12,36 @@ from base58 import b58encode_check
 from tronpy import Tron
 from tronpy.providers import HTTPProvider
 from tronpy.keys import PrivateKey
-from sqlite3 import connect, OperationalError
+from sqlite3 import connect
 from threading import Thread, Event
 from queue import Queue, Empty
 import schedule
 from datetime import datetime
+from flask import Flask, request, jsonify
 
 load_dotenv()
+
+# Initialize monitor as None - will be set in __main__
+monitor = None
+
+app = Flask(__name__)
+
+@app.route('/new')
+def add_new_address():
+    if monitor is None:
+        return jsonify({"error": "Monitor not initialized"}), 500
+        
+    address = request.args.get('address')
+    if not address:
+        return jsonify({"error": "address parameter is required"}), 400
+    if not address.startswith('0x') or len(address) != 42:
+        return jsonify({"error": "invalid address format"}), 400
+    
+    try:
+        monitor.add_address(address)
+        return jsonify({"success": True, "message": f"Added {address} to monitoring"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # Database setup
 DB_PATH = os.getenv("DB_PATH", "addresses.db")
@@ -99,8 +122,8 @@ class BIP32:
             data = parent_pub_key + i.to_bytes(4, "big")
 
         # Calculate I
-        I = hmac.new(parent_chain_code, data, hashlib.sha512).digest()
-        IL, IR = I[:32], I[32:]
+        ii = hmac.new(parent_chain_code, data, hashlib.sha512).digest()
+        IL, IR = ii[:32], ii[32:]
 
         # Calculate child private key
         IL_int = int.from_bytes(IL, "big")
@@ -125,8 +148,8 @@ class BIP32:
         data = parent_pub_key + i.to_bytes(4, "big")
 
         # Calculate I
-        I = hmac.new(parent_chain_code, data, hashlib.sha512).digest()
-        IL, IR = I[:32], I[32:]
+        ii = hmac.new(parent_chain_code, data, hashlib.sha512).digest()
+        IL, IR = ii[:32], ii[32:]
 
         # Convert IL to point and add to parent pubkey point
         IL_int = int.from_bytes(IL, "big")
@@ -257,9 +280,17 @@ class AddressMonitor:
         self.xprv = xprv
         self.stop_event = Event()
         self.queue = Queue()
+        self.active_monitors = {}  # Track active monitoring threads
         
-        # Start worker threads
-        Thread(target=self._process_queue, daemon=True).start()
+        # Reset any stuck addresses from previous runs
+        with connect(DB_PATH) as conn:
+            conn.execute("""
+                UPDATE entropy_addresses 
+                SET processing = FALSE 
+                WHERE processing = TRUE
+            """)
+        
+        # Start scheduler thread
         Thread(target=self._schedule_checks, daemon=True).start()
 
     def add_address(self, entropy_address: str):
@@ -271,6 +302,9 @@ class AddressMonitor:
 
     def _get_pending_addresses(self):
         with connect(DB_PATH) as conn:
+            # Enable datetime functions
+            conn.execute("PRAGMA datetime_functions = ON")
+            
             cursor = conn.execute("""
                 UPDATE entropy_addresses 
                 SET processing = TRUE 
@@ -278,6 +312,8 @@ class AddressMonitor:
                     SELECT address 
                     FROM entropy_addresses 
                     WHERE processing = FALSE 
+                        AND (last_checked IS NULL 
+                             OR strftime('%s', 'now') - strftime('%s', last_checked) >= 5)
                     ORDER BY created_at 
                     LIMIT 100
                 )
@@ -286,30 +322,43 @@ class AddressMonitor:
             return [row[0] for row in cursor.fetchall()]
 
     def _schedule_checks(self):
-        schedule.every(5).seconds.do(self._enqueue_addresses)
+        schedule.every(5).seconds.do(self._start_new_monitors)
         while not self.stop_event.is_set():
             schedule.run_pending()
             time.sleep(1)
 
     def _enqueue_addresses(self):
-        addresses = self._get_pending_addresses()
+        # Debug: show all addresses in DB
+        with connect(DB_PATH) as conn:
+            cursor = conn.execute("""
+                SELECT address, processing, last_checked 
+                FROM entropy_addresses
+                ORDER BY created_at
+            """)
+            rows = cursor.fetchall()
+            if rows:
+                print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Current DB state:")
+                for row in rows:
+                    print(f"  Address: {row[0][:10]}...{row[0][-8:]}, Processing: {row[1]}, Last checked: {row[2]}")
+                print()
+        return self._get_pending_addresses()
+
+    def _start_new_monitors(self):
+        # Clean up finished threads
+        self.active_monitors = {addr: thread for addr, thread in self.active_monitors.items() 
+                              if thread.is_alive()}
+        
+        # Get new addresses to monitor
+        addresses = self._enqueue_addresses()
         if addresses:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Found {len(addresses)} addresses to monitor")
+            
+        # Start new monitoring threads for addresses not already being monitored
         for address in addresses:
-            self.queue.put(address)
-
-    def _process_queue(self):
-        while not self.stop_event.is_set():
-            try:
-                entropy_address = self.queue.get(timeout=1)
-                try:
-                    self._monitor_address(entropy_address)
-                finally:
-                    self.queue.task_done()
-            except Empty:
-                continue  # No items in queue, continue waiting
-            except Exception as e:
-                print(f"Error processing address: {e}")
+            if address not in self.active_monitors:
+                thread = Thread(target=self._monitor_address, args=(address,), daemon=True)
+                thread.start()
+                self.active_monitors[address] = thread
 
     def _monitor_address(self, entropy_address: str):
         path = derive_path(entropy_address)
@@ -327,16 +376,8 @@ class AddressMonitor:
                     if balance > 0:
                         print(f"[{datetime.now().strftime('%H:%M:%S')}] Found positive balance, processing...")
                         self._handle_balance(child_tron_address, bip32, path)
-                        break  # Balance handled, stop monitoring
-                        
-                    # Update last checked time
-                    with connect(DB_PATH) as conn:
-                        conn.execute("""
-                            UPDATE entropy_addresses 
-                            SET last_checked = CURRENT_TIMESTAMP,
-                                processing = FALSE 
-                            WHERE address = ?
-                        """, (entropy_address,))
+                        # Successfully handled balance, stop monitoring this address
+                        return
                     
                     time.sleep(5)  # Check balance every 5 seconds
                     
@@ -345,10 +386,13 @@ class AddressMonitor:
                     time.sleep(5)
         
         finally:
+            # Only mark as not processing if we're stopping monitoring
+            # (either due to successful balance handling or stop event)
             with connect(DB_PATH) as conn:
                 conn.execute("""
                     UPDATE entropy_addresses 
-                    SET processing = FALSE 
+                    SET processing = FALSE,
+                        last_checked = CURRENT_TIMESTAMP
                     WHERE address = ?
                 """, (entropy_address,))
 
@@ -412,10 +456,10 @@ class AddressMonitor:
     def stop(self):
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Shutting down monitor...")
         self.stop_event.set()
-        try:
-            self.queue.join(timeout=5)  # Wait up to 5 seconds for tasks to complete
-        except TimeoutError:
-            print("Some tasks did not complete in time")
+        
+        # Wait for all monitoring threads to finish
+        for thread in self.active_monitors.values():
+            thread.join(timeout=5)
 
 # Main logic
 if __name__ == "__main__":
@@ -423,12 +467,10 @@ if __name__ == "__main__":
     xprv = os.getenv("ROOT_XPRV")
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting address monitor...")
     monitor = AddressMonitor(xprv)
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Monitor initialized, adding test address...")
-    monitor.add_address("0x1234567890123456789012345678901234567890")
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Test address added, monitoring started")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Monitor initialized")
     
     try:
-        while True:
-            time.sleep(1)
+        # Run Flask app
+        app.run(host='0.0.0.0', port=8453)
     except KeyboardInterrupt:
         monitor.stop()
