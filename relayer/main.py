@@ -437,7 +437,7 @@ class AddressMonitor:
         
         usdt = client.get_contract("TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t")
         balance = usdt.functions.balanceOf(child_tron_address)
-        if balance == 0:
+        if balance <= 1:
             print("Balance is 0, skipping")
             return
 
