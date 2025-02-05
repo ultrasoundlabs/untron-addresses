@@ -20,6 +20,7 @@ from datetime import datetime
 from flask import Flask, request, jsonify, redirect
 
 load_dotenv()
+print(os.getenv("EVM_RPC_URL"))
 
 # Initialize monitor as None - will be set in __main__
 monitor = None
@@ -439,7 +440,6 @@ class AddressMonitor:
         if balance == 0:
             print("Balance is 0, skipping")
             return
-        balance -= 1 # subtract 0.000001 USDT so that transfers are cheaper
 
         try:
             trx_balance = client.get_account_balance(child_tron_address)
@@ -526,7 +526,7 @@ class AddressMonitor:
 
         txn = (
             sunswap_v2.functions.swapExactTokensForTokens(
-                balance,
+                balance-1, # subtract 0.000001 USDT so that transfers are cheaper
                 1,  # we know that there'd be no slippage
                 [
                     "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
