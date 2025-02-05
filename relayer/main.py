@@ -439,6 +439,7 @@ class AddressMonitor:
         if balance == 0:
             print("Balance is 0, skipping")
             return
+        balance -= 1 # subtract 0.000001 USDT so that transfers are cheaper
 
         try:
             trx_balance = client.get_account_balance(child_tron_address)
@@ -450,6 +451,8 @@ class AddressMonitor:
         # Initialize Web3 for EVM chain first
         w3 = Web3(Web3.HTTPProvider(os.getenv("EVM_RPC_URL")))
         evm_account = w3.eth.account.from_key(os.getenv("EVM_PRIVATE_KEY"))
+
+        print(os.getenv("EVM_RPC_URL"))
 
         # Get USDT contract on EVM chain
         usdt_abi = [
@@ -507,7 +510,7 @@ class AddressMonitor:
         if allowance == 0:
             print("Allowance is 0, setting max approval")
 
-            lend_energy(child_tron_address, 101000)  # enough for the approval and swap
+            lend_energy(child_tron_address, 101100)  # enough for the approval and swap
 
             txn = (
                 usdt.functions.approve(sunswap_v2.address, 2**256 - 1)
