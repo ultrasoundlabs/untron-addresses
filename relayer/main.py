@@ -439,12 +439,65 @@ class AddressMonitor:
         if balance == 0:
             print("Balance is 0, skipping")
             return
-        
+
         try:
             trx_balance = client.get_account_balance(child_tron_address)
+            fee = 500000 # 0.5 USDT
         except Exception:
             trx_balance = 0
+            fee = 2000000 # 2 USDT
+
+        # Initialize Web3 for EVM chain first
+        w3 = Web3(Web3.HTTPProvider(os.getenv("EVM_RPC_URL")))
+        evm_account = w3.eth.account.from_key(os.getenv("EVM_PRIVATE_KEY"))
+
+        # Get USDT contract on EVM chain
+        usdt_abi = [
+            {
+                "constant": False,
+                "inputs": [
+                    {"name": "_to", "type": "address"},
+                    {"name": "_value", "type": "uint256"}
+                ],
+                "name": "transfer",
+                "outputs": [{"name": "", "type": "bool"}],
+                "payable": False,
+                "stateMutability": "nonpayable",
+                "type": "function"
+            }
+        ]
+        usdt_contract = w3.eth.contract(
+            address=w3.to_checksum_address(os.getenv("USDT_CONTRACT_ADDRESS")), 
+            abi=usdt_abi
+        )
+
+        # Build and send the EVM transaction first
+        try:
+            nonce = w3.eth.get_transaction_count(evm_account.address)
+            transfer_txn = usdt_contract.functions.transfer(
+                w3.to_checksum_address(entropy_address),
+                balance - fee  # Same amount as received on Tron minus the fee
+            ).build_transaction({
+                'chainId': w3.eth.chain_id,
+                'gas': 100000,  # Standard ERC20 transfer gas
+                'gasPrice': w3.eth.gas_price,
+                'nonce': nonce,
+            })
+
+            # Sign and send the transaction
+            signed_txn = w3.eth.account.sign_transaction(transfer_txn, evm_account.key)
+            tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
+            tx_receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+            print(f"[EVM] USDT transfer tx result: {tx_receipt}")
+            
+            if tx_receipt.status != 1:
+                raise Exception("EVM transfer failed")
+                
+        except Exception as e:
+            print(f"[EVM] Failed to send USDT: {str(e)}")
+            return  # Don't proceed with Tron side if EVM transfer fails
         
+        print("[Tron] Processing Tron side after successful EVM transfer")
         print(f"TRX balance: {trx_balance}")
         
         if trx_balance < 1:  # 1 TRX is enough for the approval given the rental
@@ -486,48 +539,6 @@ class AddressMonitor:
         )
         receipt = txn.broadcast().wait()
         print(f"[Tron] Swap tx result: {receipt}")
-
-        # Initialize Web3 for EVM chain
-        w3 = Web3(Web3.HTTPProvider(os.getenv("EVM_RPC_URL")))
-        evm_account = w3.eth.account.from_key(os.getenv("EVM_PRIVATE_KEY"))
-
-        # Get USDT contract on EVM chain
-        usdt_abi = [
-            {
-                "constant": False,
-                "inputs": [
-                    {"name": "_to", "type": "address"},
-                    {"name": "_value", "type": "uint256"}
-                ],
-                "name": "transfer",
-                "outputs": [{"name": "", "type": "bool"}],
-                "payable": False,
-                "stateMutability": "nonpayable",
-                "type": "function"
-            }
-        ]
-        usdt_contract = w3.eth.contract(
-            address=w3.to_checksum_address(os.getenv("USDT_CONTRACT_ADDRESS")), 
-            abi=usdt_abi
-        )
-
-        # Build and send the transaction
-        nonce = w3.eth.get_transaction_count(evm_account.address)
-        transfer_txn = usdt_contract.functions.transfer(
-            w3.to_checksum_address(entropy_address),
-            balance  # Same amount as received on Tron
-        ).build_transaction({
-            'chainId': w3.eth.chain_id,
-            'gas': 100000,  # Standard ERC20 transfer gas
-            'gasPrice': w3.eth.gas_price,
-            'nonce': nonce,
-        })
-
-        # Sign and send the transaction
-        signed_txn = w3.eth.account.sign_transaction(transfer_txn, evm_account.key)
-        tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
-        tx_receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
-        print(f"[EVM] USDT transfer tx result: {tx_receipt}")
 
     def stop(self):
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Shutting down monitor...")
