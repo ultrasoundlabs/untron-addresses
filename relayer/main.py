@@ -17,7 +17,7 @@ from threading import Thread, Event
 from queue import Queue
 import schedule
 from datetime import datetime
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
 
 load_dotenv()
 
@@ -25,6 +25,10 @@ load_dotenv()
 monitor = None
 
 app = Flask(__name__)
+
+@app.route('/')
+def root():
+    return redirect('https://untron.eth.limo', code=301)
 
 @app.route('/api/addresses/inform')
 def add_new_address():
