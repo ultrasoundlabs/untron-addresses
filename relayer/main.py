@@ -26,7 +26,7 @@ monitor = None
 
 app = Flask(__name__)
 
-@app.route('/new')
+@app.route('/api/addresses/inform')
 def add_new_address():
     if monitor is None:
         return jsonify({"error": "Monitor not initialized"}), 500
@@ -43,8 +43,27 @@ def add_new_address():
         return jsonify({"error": "invalid address format"}), 400
     
     try:
+        # Derive the Tron address
+        path = derive_path(address)
+        bip32 = BIP32(monitor.xprv)
+        tron_address = bip32.derive_tron_address(path)
+        
+        # Check if address already exists in DB
+        with connect(DB_PATH) as conn:
+            cursor = conn.execute("SELECT address FROM entropy_addresses WHERE address = ?", (address,))
+            if cursor.fetchone():
+                return jsonify({
+                    "success": True, 
+                    "message": f"Address {address} is already being monitored",
+                    "tron_address": tron_address
+                }), 200
+        
         monitor.add_address(address)
-        return jsonify({"success": True, "message": f"Added {address} to monitoring"}), 200
+        return jsonify({
+            "success": True, 
+            "message": f"Added {address} to monitoring",
+            "tron_address": tron_address
+        }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

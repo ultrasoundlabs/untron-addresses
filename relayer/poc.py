@@ -252,7 +252,7 @@ if __name__ == "__main__":
     xprv = os.getenv("ROOT_XPRV")
 
     # Example entropy address in the EVM format
-    entropy_address = "0x1234567890123456789012345678901234567890"
+    entropy_address = "0x93F296B84f7442Cc63ECD25C1E076d084f136A5E"
     print(f"Entropy address: {entropy_address}")
 
     # Get derivation path from the EVM entropy address
