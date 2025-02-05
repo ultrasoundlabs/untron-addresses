@@ -184,3 +184,5 @@ anvil-zksync.log
 addresses.db
 
 node_modules
+
+config.json

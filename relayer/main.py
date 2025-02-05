@@ -4,8 +4,8 @@ import os
 import time
 import base58
 import ecdsa
+import json
 from typing import Tuple, List
-from dotenv import load_dotenv
 from requests import Session
 from web3 import Web3
 from base58 import b58encode_check
@@ -19,8 +19,10 @@ import schedule
 from datetime import datetime
 from flask import Flask, request, jsonify, redirect
 
-load_dotenv()
-print(os.getenv("EVM_RPC_URL"))
+# Load config
+with open('config.json', 'r') as f:
+    config = json.load(f)
+    print(config["chains"])
 
 # Initialize monitor as None - will be set in __main__
 monitor = None
@@ -37,10 +39,16 @@ def add_new_address():
         return jsonify({"error": "Monitor not initialized"}), 500
         
     address = request.args.get('address')
+    chain_id = request.args.get('chain_id')
+    
     if not address:
         return jsonify({"error": "address parameter is required"}), 400
+    if not chain_id:
+        return jsonify({"error": "chain_id parameter is required"}), 400
     if not address.startswith('0x') or len(address) != 42:
         return jsonify({"error": "invalid address format"}), 400
+    if chain_id not in config['chains']:
+        return jsonify({"error": "unsupported chain ID"}), 400
     
     try:
         bytes.fromhex(address[2:])
@@ -48,25 +56,28 @@ def add_new_address():
         return jsonify({"error": "invalid address format"}), 400
     
     try:
-        # Derive the Tron address
-        path = derive_path(address)
+        # Derive the Tron address using chain ID as last index
+        path = derive_path(address, chain_id)
         bip32 = BIP32(monitor.xprv)
         tron_address = bip32.derive_tron_address(path)
         
         # Check if address already exists in DB
         with connect(DB_PATH) as conn:
-            cursor = conn.execute("SELECT address FROM entropy_addresses WHERE address = ?", (address,))
+            cursor = conn.execute(
+                "SELECT address FROM entropy_addresses WHERE address = ? AND chain_id = ?", 
+                (address, chain_id)
+            )
             if cursor.fetchone():
                 return jsonify({
                     "success": True, 
-                    "message": f"Address {address} is already being monitored",
+                    "message": f"Address {address} on chain {chain_id} is already being monitored",
                     "tron_address": tron_address
                 }), 200
         
-        monitor.add_address(address)
+        monitor.add_address(address, chain_id)
         return jsonify({
             "success": True, 
-            "message": f"Added {address} to monitoring",
+            "message": f"Added {address} on chain {chain_id} to monitoring",
             "tron_address": tron_address
         }), 200
     except Exception as e:
@@ -79,10 +90,12 @@ def init_db():
     with connect(DB_PATH) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS entropy_addresses (
-                address TEXT PRIMARY KEY,
+                address TEXT,
+                chain_id TEXT,
                 processing BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_checked TIMESTAMP
+                last_checked TIMESTAMP,
+                PRIMARY KEY (address, chain_id)
             )
         """)
 
@@ -90,13 +103,14 @@ init_db()
 
 client = Tron(
     provider=HTTPProvider(
-        "https://api.trongrid.io/jsonrpc", api_key=os.getenv("TRONGRID_API_KEY")
+        config['tron']['rpc_url'], 
+        api_key=config['tron']['api_key']
     )
 )
 
-private_key = PrivateKey(bytes.fromhex(os.getenv("TRON_PRIVATE_KEY").lstrip("0x")))
+private_key = PrivateKey(bytes.fromhex(config['tron']['private_key'].lstrip("0x")))
 relayer_address = private_key.public_key.to_base58check_address()
-sunswap_v2 = client.get_contract("TXF1xDbVGdxFGbovmmmXvBGu8ZiE3Lq4mR")
+sunswap_v2 = client.get_contract(config['tron']['sunswap_v2'])
 
 
 class BIP32:
@@ -245,8 +259,8 @@ class BIP32:
         return b58encode_check(b"\x41" + address).decode()
 
 
-def derive_path(entropy_address: str) -> str:
-    """Derive derivation path from entropy address"""
+def derive_path(entropy_address: str, chain_id: str) -> str:
+    """Derive derivation path from entropy address and chain ID"""
     # Convert entropy address to bytes
     entropy_bytes = bytes.fromhex(entropy_address[2:])
 
@@ -255,6 +269,9 @@ def derive_path(entropy_address: str) -> str:
     for i in range(0, len(entropy_bytes), 2):
         index = int.from_bytes(entropy_bytes[i : i + 2], "big")
         indices.append(str(index))
+    
+    # Add chain ID as the last index
+    indices.append(chain_id)
 
     # Join indices with / to create path
     return f"m/{'/'.join(indices)}"
@@ -262,7 +279,7 @@ def derive_path(entropy_address: str) -> str:
 # Lends energy to the address using feee.io API V3
 def lend_energy(to: str, amount: int):
     session = Session()
-    session.headers["key"] = os.getenv("FEEE_API_KEY")
+    session.headers["key"] = config['tron']['feee_api_key']
     session.headers["Content-Type"] = "application/json"
 
     # Create order using V3 API
@@ -280,8 +297,6 @@ def lend_energy(to: str, amount: int):
             print("Failed to create order:", result["msg"])
             return False
 
-        # V3 API sends energy within 3-6 seconds if successful
-        # No need to poll status since rental time is fixed at 5 minutes
         if result["data"]["business_status"] >= 1:
             print("Energy rented successfully")
             time.sleep(10)
@@ -296,7 +311,7 @@ def supply_address(address: str):
     txn = (
         client.trx.transfer(relayer_address, address, 10_000_000)
         .with_owner(relayer_address)
-        .fee_limit(2_000_000) # in case not initialized yet
+        .fee_limit(2_000_000)
         .build()
         .sign(private_key)
     )
@@ -309,8 +324,8 @@ class AddressMonitor:
         self.xprv = xprv
         self.stop_event = Event()
         self.queue = Queue()
-        self.active_monitors = {}  # Track active monitoring threads
-        self.entropy_addresses = {}  # Track entropy addresses for each monitored address
+        self.active_monitors = {}
+        self.entropy_addresses = {}
         
         # Reset any stuck addresses from previous runs
         with connect(DB_PATH) as conn:
@@ -319,32 +334,38 @@ class AddressMonitor:
                 SET processing = FALSE 
                 WHERE processing = TRUE
             """)
+            
+            # Load existing addresses from DB
+            cursor = conn.execute("SELECT address, chain_id FROM entropy_addresses")
+            for entropy_address, chain_id in cursor.fetchall():
+                path = derive_path(entropy_address, chain_id)
+                bip32 = BIP32(self.xprv)
+                child_tron_address = bip32.derive_tron_address(path)
+                self.entropy_addresses[child_tron_address] = (entropy_address, chain_id)
         
         # Start scheduler thread
         Thread(target=self._schedule_checks, daemon=True).start()
 
-    def add_address(self, entropy_address: str):
+    def add_address(self, entropy_address: str, chain_id: str):
         with connect(DB_PATH) as conn:
             conn.execute("""
-                INSERT OR IGNORE INTO entropy_addresses (address) 
-                VALUES (?)
-            """, (entropy_address,))
+                INSERT OR IGNORE INTO entropy_addresses (address, chain_id) 
+                VALUES (?, ?)
+            """, (entropy_address, chain_id))
         # Store the entropy address for later use
-        path = derive_path(entropy_address)
+        path = derive_path(entropy_address, chain_id)
         bip32 = BIP32(self.xprv)
         child_tron_address = bip32.derive_tron_address(path)
-        self.entropy_addresses[child_tron_address] = entropy_address
+        self.entropy_addresses[child_tron_address] = (entropy_address, chain_id)
 
     def _get_pending_addresses(self):
         with connect(DB_PATH) as conn:
-            # Enable datetime functions
             conn.execute("PRAGMA datetime_functions = ON")
-            
             cursor = conn.execute("""
                 UPDATE entropy_addresses 
                 SET processing = TRUE 
-                WHERE address IN (
-                    SELECT address 
+                WHERE (address, chain_id) IN (
+                    SELECT address, chain_id 
                     FROM entropy_addresses 
                     WHERE processing = FALSE 
                         AND (last_checked IS NULL 
@@ -352,9 +373,9 @@ class AddressMonitor:
                     ORDER BY created_at 
                     LIMIT 100
                 )
-                RETURNING address
+                RETURNING address, chain_id
             """)
-            return [row[0] for row in cursor.fetchall()]
+            return cursor.fetchall()
 
     def _schedule_checks(self):
         schedule.every(5).seconds.do(self._start_new_monitors)
@@ -389,20 +410,20 @@ class AddressMonitor:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Found {len(addresses)} addresses to monitor")
             
         # Start new monitoring threads for addresses not already being monitored
-        for address in addresses:
-            if address not in self.active_monitors:
-                thread = Thread(target=self._monitor_address, args=(address,), daemon=True)
+        for address, chain_id in addresses:
+            if (address, chain_id) not in self.active_monitors:
+                thread = Thread(target=self._monitor_address, args=(address, chain_id), daemon=True)
                 thread.start()
-                self.active_monitors[address] = thread
+                self.active_monitors[(address, chain_id)] = thread
 
-    def _monitor_address(self, entropy_address: str):
-        path = derive_path(entropy_address)
+    def _monitor_address(self, entropy_address: str, chain_id: str):
+        path = derive_path(entropy_address, chain_id)
         bip32 = BIP32(self.xprv)
         
         try:
             child_tron_address = bip32.derive_tron_address(path)
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Started monitoring {entropy_address[:10]}...{entropy_address[-8:]} -> {child_tron_address}")
-            usdt = client.get_contract("TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t")
+            usdt = client.get_contract(config['tron']['usdt_contract'])
             
             while not self.stop_event.is_set():
                 try:
@@ -428,14 +449,18 @@ class AddressMonitor:
                     UPDATE entropy_addresses 
                     SET processing = FALSE,
                         last_checked = CURRENT_TIMESTAMP
-                    WHERE address = ?
-                """, (entropy_address,))
+                    WHERE address = ? AND chain_id = ?
+                """, (entropy_address, chain_id))
 
     def _handle_balance(self, child_tron_address: str, bip32: BIP32, path: str, entropy_address: str):
         child_privkey = bip32.derive_child_privkey(path)
         child_signer = PrivateKey(bytes.fromhex(child_privkey))
         
-        usdt = client.get_contract("TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t")
+        # Get chain-specific config
+        entropy_address, chain_id = self.entropy_addresses[child_tron_address]
+        chain_config = config['chains'][chain_id]
+        
+        usdt = client.get_contract(config['tron']['usdt_contract'])
         balance = usdt.functions.balanceOf(child_tron_address)
         if balance <= 1:
             print("Balance is 0, skipping")
@@ -448,13 +473,11 @@ class AddressMonitor:
             trx_balance = 0
             fee = 2000000 # 2 USDT
 
-        # Initialize Web3 for EVM chain first
-        w3 = Web3(Web3.HTTPProvider(os.getenv("EVM_RPC_URL")))
-        evm_account = w3.eth.account.from_key(os.getenv("EVM_PRIVATE_KEY"))
+        # Initialize Web3 for target chain
+        w3 = Web3(Web3.HTTPProvider(chain_config['rpc_url']))
+        evm_account = w3.eth.account.from_key(chain_config['private_key'])
 
-        print(os.getenv("EVM_RPC_URL"))
-
-        # Get USDT contract on EVM chain
+        # Get USDT contract on target chain
         usdt_abi = [
             {
                 "constant": False,
@@ -470,24 +493,23 @@ class AddressMonitor:
             }
         ]
         usdt_contract = w3.eth.contract(
-            address=w3.to_checksum_address(os.getenv("USDT_CONTRACT_ADDRESS")), 
+            address=w3.to_checksum_address(chain_config['usdt_contract']), 
             abi=usdt_abi
         )
 
-        # Build and send the EVM transaction first
+        # Build and send the EVM transaction
         try:
             nonce = w3.eth.get_transaction_count(evm_account.address)
             transfer_txn = usdt_contract.functions.transfer(
                 w3.to_checksum_address(entropy_address),
-                balance - fee  # Same amount as received on Tron minus the fee
+                balance - fee
             ).build_transaction({
-                'chainId': w3.eth.chain_id,
-                'gas': 100000,  # Standard ERC20 transfer gas
+                'chainId': int(chain_id),
+                'gas': 100000,
                 'gasPrice': w3.eth.gas_price,
                 'nonce': nonce,
             })
 
-            # Sign and send the transaction
             signed_txn = w3.eth.account.sign_transaction(transfer_txn, evm_account.key)
             tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
             tx_receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
@@ -498,19 +520,19 @@ class AddressMonitor:
                 
         except Exception as e:
             print(f"[EVM] Failed to send USDT: {str(e)}")
-            return  # Don't proceed with Tron side if EVM transfer fails
+            return
         
         print("[Tron] Processing Tron side after successful EVM transfer")
         print(f"TRX balance: {trx_balance}")
         
-        if trx_balance < 1:  # 1 TRX is enough for the approval given the rental
+        if trx_balance < 1:
             supply_address(child_tron_address)
         
         allowance = usdt.functions.allowance(child_tron_address, sunswap_v2.address)
         if allowance == 0:
             print("Allowance is 0, setting max approval")
 
-            lend_energy(child_tron_address, 101100)  # enough for the approval and swap
+            lend_energy(child_tron_address, 101100)
 
             txn = (
                 usdt.functions.approve(sunswap_v2.address, 2**256 - 1)
@@ -526,14 +548,14 @@ class AddressMonitor:
 
         txn = (
             sunswap_v2.functions.swapExactTokensForTokens(
-                balance-1, # subtract 0.000001 USDT so that transfers are cheaper
-                1,  # we know that there'd be no slippage
+                balance-1,
+                1,
                 [
-                    "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
-                    "TPXxtMtQg95VX8JRCiQ5SXqSeHjuNaMsxi"
+                    config['tron']['usdt_contract'],
+                    config['tron']['wrapped_usdt']
                 ],
-                relayer_address,  # swap new USDT into wrapped tokens and send them to the relayer
-                9999999999,  # large deadline
+                relayer_address,
+                9999999999,
             )
             .with_owner(child_tron_address)
             .fee_limit(2_000_000)
@@ -547,20 +569,15 @@ class AddressMonitor:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Shutting down monitor...")
         self.stop_event.set()
         
-        # Wait for all monitoring threads to finish
         for thread in self.active_monitors.values():
             thread.join(timeout=5)
 
 # Main logic
 if __name__ == "__main__":
-    # Import xprv from .env
-    xprv = os.getenv("ROOT_XPRV")
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting address monitor...")
-    monitor = AddressMonitor(xprv)
+    monitor = AddressMonitor(config['root_xprv'])
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Monitor initialized")
     
     try:
-        # Run Flask app
         app.run(host='0.0.0.0', port=8453)
     except KeyboardInterrupt:
         monitor.stop()

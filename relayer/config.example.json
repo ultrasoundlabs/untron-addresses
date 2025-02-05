@@ -1,0 +1,32 @@
+{
+  "chains": {
+    "1": {
+      "name": "Ethereum",
+      "rpc_url": "https://eth.llamarpc.com",
+      "usdt_contract": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+      "private_key": ""
+    },
+    "56": {
+      "name": "BNB Smart Chain",
+      "rpc_url": "https://bsc-dataseed.binance.org",
+      "usdt_contract": "0x55d398326f99059fF775485246999027B3197955",
+      "private_key": ""
+    },
+    "137": {
+      "name": "Polygon",
+      "rpc_url": "https://polygon-rpc.com",
+      "usdt_contract": "0xc2132D05D31c914a87C6611C10748AEb04B58e8F",
+      "private_key": ""
+    }
+  },
+  "tron": {
+    "rpc_url": "https://api.trongrid.io/jsonrpc",
+    "api_key": "",
+    "private_key": "",
+    "feee_api_key": "",
+    "sunswap_v2": "TXF1xDbVGdxFGbovmmmXvBGu8ZiE3Lq4mR",
+    "usdt_contract": "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
+    "wrapped_usdt": "TPXxtMtQg95VX8JRCiQ5SXqSeHjuNaMsxi"
+  },
+  "root_xprv": ""
+} 
