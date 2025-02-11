@@ -17,7 +17,7 @@ from threading import Thread, Event
 from queue import Queue
 import schedule
 from datetime import datetime
-from flask import Flask, request, jsonify, redirect
+from flask import Flask, request, jsonify
 
 # Load config
 with open('config.json', 'r') as f:
@@ -29,11 +29,7 @@ monitor = None
 
 app = Flask(__name__)
 
-@app.route('/')
-def root():
-    return redirect('https://untron.eth.limo', code=301)
-
-@app.route('/api/addresses/inform')
+@app.route('/inform')
 def add_new_address():
     if monitor is None:
         return jsonify({"error": "Monitor not initialized"}), 500
